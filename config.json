@@ -1,0 +1,11 @@
+[
+    {
+        "tomcat": "http://and-mf-openwis-02:8080",
+        "username": "mavenuser",
+        "password": "password",
+        "folder":"/opt/workspace/openwis/openwis-docker/openwis-metadataportal/openwis-portal/...",
+        "regex":"openwis-user-portal.war$"
+    }
+]
+
+
