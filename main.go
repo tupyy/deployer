@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -23,15 +24,10 @@ import (
 var (
 	configurationFile string
 	configuration     []ConfigurationEntry
-)
 
-type ConfigurationEntry struct {
-	TomcatAddr string `json:"tomcat"`
-	Username   string
-	Password   string
-	Folder     string
-	Regex      string
-}
+	// holds the hash of the in progress deploying and the canceling channel
+	deployMap = make(map[string]chan chan struct{})
+)
 
 // encode username and password
 func basicAuth(username, password string) string {
@@ -39,7 +35,12 @@ func basicAuth(username, password string) string {
 	return base64.StdEncoding.EncodeToString([]byte(auth))
 }
 
-func deployWar(addr, user, pass, warpath string) {
+func deployWar(addr, user, pass, warpath string, done chan chan struct{}) {
+	var (
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
+
 	log.Println("Start deploying: ", warpath, "to", addr)
 
 	basename := path.Base(warpath)
@@ -49,19 +50,36 @@ func deployWar(addr, user, pass, warpath string) {
 	var defaultTtransport http.RoundTripper = &http.Transport{Proxy: nil}
 	client := &http.Client{Transport: defaultTtransport}
 
+	// create context
+	ctx, cancel = context.WithCancel(context.Background())
+	defer cancel()
+
 	body, err := ioutil.ReadFile(warpath)
 	if err != nil {
 		log.Fatal("Error reading war: ", err)
 	}
 
-	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(body))
+	// Create the request with context to be able to cancel it
+	req, err := http.NewRequestWithContext(ctx, "PUT", url, bytes.NewBuffer(body))
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	req.Header.Add("Authorization", fmt.Sprintf("Basic %s", basicAuth(user, pass)))
-	resp, err := client.Do(req)
-	log.Println("War deployed. Status code: ", resp.Status)
+
+	c := make(chan *http.Response, 1)
+	go func() {
+		resp, _ := client.Do(req)
+		c <- resp
+	}()
+
+	select {
+	case r := <-c:
+		log.Println("War deployed. Status code: ", r.Status)
+	case responseCh := <-done:
+		log.Println("Deploy canceled.")
+		cancel()
+		responseCh <- struct{}{}
+	}
 }
 
 // watch a folder for changes and execute handleFunc when a regex is true
@@ -82,7 +100,7 @@ func watch(data ConfigurationEntry, result chan ConfigurationEntry, done chan st
 		case ei := <-c:
 			if r.MatchString(ei.Path()) {
 				log.Println("New war detected: ", ei.Path())
-				deployWar(data.TomcatAddr, data.Username, data.Password, ei.Path())
+				data.File = ei.Path()
 				result <- data
 				return
 			}
@@ -110,23 +128,55 @@ func main() {
 
 	var wg sync.WaitGroup
 	result := make(chan ConfigurationEntry)
-	done := make(chan struct{})
-	doneWorkers := make(chan struct{})
+	done := make(chan chan struct{})
+	doneWatcherCh := make(chan struct{})
 
-	go func(done chan struct{}) {
+	go func(done chan chan struct{}) {
 		for {
 			select {
 			case configurationEntry := <-result:
 				// once a worker finished deploying respawn it
-				log.Println("Spawn worker for", configurationEntry.Folder)
-				wg.Add(1)
+				if doneCh, ok := deployMap[configurationEntry.Hash()]; ok {
+					log.Println("Deploy in progress. Canceling it...")
+
+					responseCh := make(chan struct{})
+					doneCh <- responseCh
+
+					// wait for go routine to exit
+					<-responseCh
+				}
+				doneCh := make(chan chan struct{}, 1)
+
+				// deploy
 				go func() {
-					watch(configurationEntry, result, doneWorkers)
-					wg.Done()
+					deployWar(configurationEntry.TomcatAddr,
+						configurationEntry.Username,
+						configurationEntry.Password,
+						configurationEntry.File,
+						doneCh)
+					delete(deployMap, configurationEntry.Hash())
 				}()
-			case <-done:
-				close(doneWorkers)
-				wg.Wait()
+				deployMap[configurationEntry.Hash()] = doneCh
+
+				// re spawn the watcher
+				log.Println("Spawn worker for", configurationEntry.Folder)
+				go func() {
+					watch(configurationEntry, result, doneWatcherCh)
+				}()
+
+			case c := <-done:
+
+				// close all watchers
+				close(doneWatcherCh)
+
+				// close in progress deployments
+				for _, doneCh := range deployMap {
+					log.Println("Close worker")
+					c := make(chan struct{})
+					doneCh <- c
+					<-c
+				}
+				c <- struct{}{}
 				return
 			}
 		}
@@ -134,7 +184,7 @@ func main() {
 
 	// start initial workers
 	for _, configurationEntry := range configuration {
-		go watch(configurationEntry, result, doneWorkers)
+		go watch(configurationEntry, result, doneWatcherCh)
 	}
 
 	c := make(chan os.Signal, 1)
@@ -144,7 +194,10 @@ func main() {
 	go func() {
 		<-c
 		log.Println("Control-C catched. Waiting for workers to exit..")
-		close(done)
+
+		waitCh := make(chan struct{})
+		done <- waitCh
+		<-waitCh
 		wg.Done()
 	}()
 
