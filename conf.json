@@ -3,8 +3,17 @@
         "tomcat": "http://localhost:8090",
         "username": "mavenuser",
         "password": "password",
-        "folder":"/opt/workspace/openwis/openwis-docker/openwis-metadataportal/openwis-portal/...",
-        "regex":"openwis-user-portal.war$"
+        "folder":"/opt/workspace/openwis/wismet/openwis-metadataportal/openwis-portal/...",
+        "appname": "openwis-admin-portal",
+        "regex":"openwis-admin-portal-admin-dev.war$"
+    },
+    {
+        "tomcat": "http://localhost:8090",
+        "username": "mavenuser",
+        "password": "password",
+        "folder":"/opt/workspace/openwis/wismet/openwis-metadataportal/openwis-portal/...",
+        "appname": "wismet-user-portal",
+        "regex":"openwis-user-portal-user-dev.war$"
     }
 ]
 
