@@ -35,7 +35,7 @@ func basicAuth(username, password string) string {
 	return base64.StdEncoding.EncodeToString([]byte(auth))
 }
 
-func deployWar(addr, user, pass, warpath string, done chan chan struct{}) {
+func deployWar(addr, user, pass, appname, warpath string, done chan chan struct{}) {
 	var (
 		ctx    context.Context
 		cancel context.CancelFunc
@@ -43,21 +43,23 @@ func deployWar(addr, user, pass, warpath string, done chan chan struct{}) {
 
 	log.Println("Start deploying: ", warpath, "to", addr)
 
-	basename := path.Base(warpath)
-	deployPath := basename[:strings.Index(basename, ".")]
-	url := fmt.Sprintf("%s/manager/text/deploy?path=/%s&update=true", addr, deployPath)
+	if len(appname) == 0 {
+		basename := path.Base(warpath)
+		appname = basename[:strings.Index(basename, ".")]
+	}
+	url := fmt.Sprintf("%s/manager/text/deploy?path=/%s&update=true", addr, appname)
 
 	var defaultTtransport http.RoundTripper = &http.Transport{Proxy: nil}
 	client := &http.Client{Transport: defaultTtransport}
-
-	// create context
-	ctx, cancel = context.WithCancel(context.Background())
-	defer cancel()
 
 	body, err := ioutil.ReadFile(warpath)
 	if err != nil {
 		log.Fatal("Error reading war: ", err)
 	}
+
+	// create context
+	ctx, cancel = context.WithCancel(context.Background())
+	defer cancel()
 
 	// Create the request with context to be able to cancel it
 	req, err := http.NewRequestWithContext(ctx, "PUT", url, bytes.NewBuffer(body))
@@ -74,7 +76,11 @@ func deployWar(addr, user, pass, warpath string, done chan chan struct{}) {
 
 	select {
 	case r := <-c:
-		log.Println("War deployed. Status code: ", r.Status)
+		if r.StatusCode != 200 {
+			log.Println("War deployed failed. Status: ", r.Status)
+		} else {
+			log.Printf("War deployed under '%s/%s/' . Status code: %s\n", addr, appname, r.Status)
+		}
 	case responseCh := <-done:
 		log.Println("Deploy canceled.")
 		cancel()
@@ -126,7 +132,6 @@ func main() {
 	}
 	log.Println(spew.Sdump(configuration))
 
-	var wg sync.WaitGroup
 	result := make(chan ConfigurationEntry)
 	done := make(chan chan struct{})
 	doneWatcherCh := make(chan struct{})
@@ -135,23 +140,22 @@ func main() {
 		for {
 			select {
 			case configurationEntry := <-result:
-				// once a worker finished deploying respawn it
+
+				// check if deployment is in progress and cancel it if so
 				if doneCh, ok := deployMap[configurationEntry.Hash()]; ok {
 					log.Println("Deploy in progress. Canceling it...")
-
 					responseCh := make(chan struct{})
 					doneCh <- responseCh
-
-					// wait for go routine to exit
 					<-responseCh
 				}
-				doneCh := make(chan chan struct{}, 1)
 
-				// deploy
+				// deploy the new war
+				doneCh := make(chan chan struct{}, 1)
 				go func() {
 					deployWar(configurationEntry.TomcatAddr,
 						configurationEntry.Username,
 						configurationEntry.Password,
+						configurationEntry.Appname,
 						configurationEntry.File,
 						doneCh)
 					delete(deployMap, configurationEntry.Hash())
@@ -187,15 +191,18 @@ func main() {
 		go watch(configurationEntry, result, doneWatcherCh)
 	}
 
+	// catch Control+C signal
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 
+	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		<-c
 		log.Println("Control-C catched. Waiting for workers to exit..")
 
 		waitCh := make(chan struct{})
+		// close main go routine. Wait for watcher and deployments to be closed.
 		done <- waitCh
 		<-waitCh
 		wg.Done()

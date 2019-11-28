@@ -12,6 +12,7 @@ type ConfigurationEntry struct {
 	Password   string
 	Folder     string
 	Regex      string
+	Appname    string
 	File       string
 }
 
